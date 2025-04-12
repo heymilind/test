@@ -13,7 +13,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getAvailable: () => ipcRenderer.invoke('models:getAvailable'),
     download: (modelId) => ipcRenderer.invoke('models:download', modelId),
     delete: (modelId) => ipcRenderer.invoke('models:delete', modelId),
-    getRecommended: () => ipcRenderer.invoke('models:recommend')
+    getRecommended: () => ipcRenderer.invoke('models:recommend'),
+    verify: (modelId) => ipcRenderer.invoke('models:verify', modelId)
   },
   
   // Events
@@ -25,5 +26,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   
   // Utilities
-  platform: process.platform
+  platform: process.platform,
+
+  // Inference
+  inference: {
+    loadModel: (modelId) => ipcRenderer.invoke('inference:loadModel', modelId),
+    generate: (params) => ipcRenderer.invoke('inference:generate', params),
+    test: (input) => ipcRenderer.invoke('inference:test', input)
+  }
 });

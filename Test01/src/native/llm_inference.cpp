@@ -1,0 +1,353 @@
+#include <napi.h>
+#include "llama.h"
+#include <vector>
+#include <string>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <cmath>
+
+class LLMInference : public Napi::ObjectWrap<LLMInference> {
+public:
+  static Napi::Object Init(Napi::Env env, Napi::Object exports);
+  LLMInference(const Napi::CallbackInfo& info);
+  ~LLMInference();
+
+private:
+  static Napi::FunctionReference constructor;
+  
+  // Methods exposed to JavaScript
+  Napi::Value LoadModel(const Napi::CallbackInfo& info);
+  Napi::Value Generate(const Napi::CallbackInfo& info);
+  Napi::Value IsModelLoaded(const Napi::CallbackInfo& info);
+  Napi::Value TestGenerate(const Napi::CallbackInfo& info);
+  
+  // Internal state
+  llama_model* model;
+  llama_context* ctx;
+  bool modelLoaded;
+  std::string modelPath;
+  
+  // Helper functions
+  void apply_softmax(float* logits, int n_vocab);
+  void apply_temperature(float* logits, int n_vocab, float temp);
+  void apply_top_p(float* logits, int n_vocab, float top_p);
+  llama_token sample_token(float* logits, int n_vocab);
+};
+
+Napi::FunctionReference LLMInference::constructor;
+
+// Helper function to apply softmax
+void LLMInference::apply_softmax(float* logits, int n_vocab) {
+  float max_logit = logits[0];
+  for (int i = 1; i < n_vocab; i++) {
+    if (logits[i] > max_logit) {
+      max_logit = logits[i];
+    }
+  }
+  
+  float sum = 0.0f;
+  for (int i = 0; i < n_vocab; i++) {
+    logits[i] = expf(logits[i] - max_logit);
+    sum += logits[i];
+  }
+  
+  for (int i = 0; i < n_vocab; i++) {
+    logits[i] /= sum;
+  }
+}
+
+// Helper function to apply temperature
+void LLMInference::apply_temperature(float* logits, int n_vocab, float temp) {
+  for (int i = 0; i < n_vocab; i++) {
+    logits[i] /= temp;
+  }
+}
+
+// Helper function to apply top-p sampling
+void LLMInference::apply_top_p(float* logits, int n_vocab, float top_p) {
+  std::vector<std::pair<float, int>> probs;
+  probs.reserve(n_vocab);
+  
+  for (int i = 0; i < n_vocab; i++) {
+    probs.push_back({logits[i], i});
+  }
+  
+  std::sort(probs.begin(), probs.end(), std::greater<>());
+  
+  float cumsum = 0.0f;
+  for (int i = 0; i < n_vocab; i++) {
+    cumsum += probs[i].first;
+    if (cumsum > top_p) {
+      for (int j = i + 1; j < n_vocab; j++) {
+        logits[probs[j].second] = 0.0f;
+      }
+      break;
+    }
+  }
+}
+
+// Helper function to sample a token
+llama_token LLMInference::sample_token(float* logits, int n_vocab) {
+  float r = (float)rand() / RAND_MAX;
+  float cdf = 0.0f;
+  
+  for (int i = 0; i < n_vocab; i++) {
+    cdf += logits[i];
+    if (r < cdf) {
+      return i;
+    }
+  }
+  
+  return n_vocab - 1;
+}
+
+Napi::Object LLMInference::Init(Napi::Env env, Napi::Object exports) {
+  Napi::HandleScope scope(env);
+
+  Napi::Function func = DefineClass(env, "LLMInference", {
+    InstanceMethod("loadModel", &LLMInference::LoadModel),
+    InstanceMethod("generate", &LLMInference::Generate),
+    InstanceMethod("isModelLoaded", &LLMInference::IsModelLoaded),
+    InstanceMethod("testGenerate", &LLMInference::TestGenerate),
+  });
+
+  constructor = Napi::Persistent(func);
+  constructor.SuppressDestruct();
+
+  exports.Set("LLMInference", func);
+  return exports;
+}
+
+LLMInference::LLMInference(const Napi::CallbackInfo& info)
+    : Napi::ObjectWrap<LLMInference>(info), model(nullptr), ctx(nullptr), modelLoaded(false) {
+  llama_backend_init();
+  srand(time(nullptr));
+}
+
+LLMInference::~LLMInference() {
+  if (ctx) {
+    llama_free(ctx);
+    ctx = nullptr;
+  }
+  
+  if (model) {
+    llama_model_free(model);
+    model = nullptr;
+  }
+  
+  llama_backend_free();
+}
+
+Napi::Value LLMInference::LoadModel(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Model path expected").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+  
+  // Clean up previous model if any
+  if (ctx) {
+    llama_free(ctx);
+    ctx = nullptr;
+  }
+  
+  if (model) {
+    llama_model_free(model);
+    model = nullptr;
+  }
+  
+  modelLoaded = false;
+  
+  try {
+    modelPath = info[0].As<Napi::String>().Utf8Value();
+    int n_ctx = info.Length() > 2 ? info[2].As<Napi::Number>().Int32Value() : 2048;
+    
+    // Load model
+    llama_model_params model_params = llama_model_default_params();
+    model = llama_model_load_from_file(modelPath.c_str(), model_params);
+    
+    if (!model) {
+      Napi::Error::New(env, "Failed to load model").ThrowAsJavaScriptException();
+      return Napi::Boolean::New(env, false);
+    }
+    
+    // Create context
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = n_ctx;
+    
+    ctx = llama_init_from_model(model, ctx_params);
+    
+    if (!ctx) {
+      llama_model_free(model);
+      model = nullptr;
+      Napi::Error::New(env, "Failed to create context").ThrowAsJavaScriptException();
+      return Napi::Boolean::New(env, false);
+    }
+    
+    modelLoaded = true;
+    return Napi::Boolean::New(env, true);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return Napi::Boolean::New(env, false);
+  }
+}
+
+Napi::Value LLMInference::IsModelLoaded(const Napi::CallbackInfo& info) {
+  return Napi::Boolean::New(info.Env(), modelLoaded);
+}
+
+Napi::Value LLMInference::Generate(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  
+  if (!modelLoaded) {
+    Napi::Error::New(env, "Model not loaded").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+  
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Prompt expected").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+
+  try {
+    std::string prompt = info[0].As<Napi::String>().Utf8Value();
+    int max_tokens = info.Length() > 1 ? info[1].As<Napi::Number>().Int32Value() : 512;
+    float temperature = info.Length() > 2 ? info[2].As<Napi::Number>().FloatValue() : 0.8f;
+    float top_p = info.Length() > 3 ? info[3].As<Napi::Number>().FloatValue() : 0.95f;
+    
+    // Tokenize prompt
+    const llama_vocab* vocab = llama_model_get_vocab(model);
+    std::vector<llama_token> tokens(prompt.size() + 4);
+    int n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.length(), tokens.data(), tokens.size(), true, false);
+    
+    if (n_tokens < 0) {
+      Napi::Error::New(env, "Failed to tokenize prompt").ThrowAsJavaScriptException();
+      return env.Null();
+    }
+    
+    tokens.resize(n_tokens);
+    
+    // Initial batch - process prompt
+    llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
+    for (size_t i = 0; i < tokens.size(); i++) {
+      batch.token[i] = tokens[i];
+      batch.pos[i] = i;
+      batch.n_seq_id[i] = 1;
+      batch.seq_id[i][0] = 0;
+      batch.logits[i] = false;
+    }
+    batch.n_tokens = tokens.size();
+    
+    if (llama_decode(ctx, batch) != 0) {
+      llama_batch_free(batch);
+      Napi::Error::New(env, "Failed to decode prompt").ThrowAsJavaScriptException();
+      return env.Null();
+    }
+    
+    llama_batch_free(batch);
+    
+    // Generate response
+    std::string result = prompt;
+    int eos_token = llama_vocab_eos(vocab);
+    llama_token new_token = 0;
+    
+    // Fixed implementation for token generation:
+    for (int i = 0; i < max_tokens; i++) {
+      // Sample next token (with proper temperature handling)
+      if (temperature <= 0.0f) {
+        // Greedy sampling
+        float* logits = llama_get_logits(ctx);
+        int n_vocab = llama_vocab_n_tokens(vocab);
+        
+        // Find the token with the highest probability
+        new_token = 0;
+        float max_logit = logits[0];
+        for (int j = 1; j < n_vocab; j++) {
+          if (logits[j] > max_logit) {
+            max_logit = logits[j];
+            new_token = j;
+          }
+        }
+      } else {
+        // Temperature sampling with top-p
+        float* logits = llama_get_logits(ctx);
+        int n_vocab = llama_vocab_n_tokens(vocab);
+        
+        // Make a copy of the logits for manipulation
+        std::vector<float> probs(logits, logits + n_vocab);
+        
+        // Apply temperature
+        for (int j = 0; j < n_vocab; j++) {
+          probs[j] /= temperature;
+        }
+        
+        // Apply softmax
+        apply_softmax(probs.data(), n_vocab);
+        
+        // Apply top-p filtering
+        apply_top_p(probs.data(), n_vocab, top_p);
+        
+        // Renormalize
+        apply_softmax(probs.data(), n_vocab);
+        
+        // Sample from the distribution
+        new_token = sample_token(probs.data(), n_vocab);
+      }
+      
+      // Check for EOS
+      if (new_token == eos_token) {
+        break;
+      }
+      
+      // Convert token to string using the proper API call with new signature
+      char token_buf[128];
+      int32_t len = llama_token_to_piece(vocab, new_token, token_buf, sizeof(token_buf), 0, true);
+      if (len > 0) {
+        token_buf[len] = '\0'; // Ensure null termination
+        result += token_buf;
+      }
+      
+      // Feed the new token back for next prediction
+      llama_batch next_batch = llama_batch_init(1, 0, 1);
+      next_batch.token[0] = new_token;
+      next_batch.pos[0] = tokens.size() + i;
+      next_batch.n_seq_id[0] = 1;
+      next_batch.seq_id[0][0] = 0;
+      next_batch.logits[0] = true;
+      next_batch.n_tokens = 1;
+      
+      if (llama_decode(ctx, next_batch) != 0) {
+        llama_batch_free(next_batch);
+        break;
+      }
+      
+      llama_batch_free(next_batch);
+    }
+    
+    return Napi::String::New(env, result);
+  } catch (const std::exception& e) {
+    Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    return env.Null();
+  }
+}
+
+Napi::Value LLMInference::TestGenerate(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(env, "Input string expected").ThrowAsJavaScriptException();
+    return env.Null();
+  }
+  
+  std::string input = info[0].As<Napi::String>().Utf8Value();
+  return Napi::String::New(env, input + " This is a test response to verify binding works.");
+}
+
+// Initialize the module
+Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
+  return LLMInference::Init(env, exports);
+}
+
+NODE_API_MODULE(llm_inference, InitModule)

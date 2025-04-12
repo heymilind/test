@@ -7,13 +7,18 @@
     "dev": "vite",
     "build": "vite build",
     "electron:dev": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron ./electron/main.cjs\"",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "rebuild": "cd src/native && node-gyp rebuild --target=$(electron -v | sed 's/v//') --arch=arm64 --dist-url=https://electronjs.org/headers && mkdir -p ../../build && cp build/Release/llm_inference.node ../../build/ && cp -r ../../build/lib/*.dylib ../../build/",
+    "postinstall": "npm run rebuild"
   },
   "dependencies": {
     "axios": "^1.8.4",
+    "bindings": "^1.5.0",
     "electron-squirrel-startup": "^1.0.1",
+    "node-fetch": "^3.3.2",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "systeminformation": "^5.25.11"
   },
   "devDependencies": {
     "@types/react": "^18.2.55",
@@ -22,12 +27,15 @@
     "autoprefixer": "^10.4.21",
     "concurrently": "^8.2.2",
     "cross-env": "^7.0.3",
-    "electron": "^28.2.1",
-    "electron-builder": "^24.9.1",
+    "electron": "^28.3.3",
+    "electron-builder": "^24.13.3",
+    "electron-rebuild": "^3.2.9",
     "eslint": "^8.56.0",
     "eslint-plugin-react": "^7.33.2",
     "eslint-plugin-react-hooks": "^4.6.0",
     "eslint-plugin-react-refresh": "^0.4.5",
+    "node-addon-api": "^8.3.1",
+    "node-gyp": "^11.2.0",
     "postcss": "^8.5.3",
     "tailwindcss": "^3.4.17",
     "vite": "^6.2.6",
